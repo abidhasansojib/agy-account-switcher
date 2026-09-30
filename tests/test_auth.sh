@@ -87,6 +87,19 @@ assert_contains "oauth-url contains client_id parameter" "$OAUTH_URL" "client_id
 VERIFIER_LEN=$(wc -c < "$TMP_VERIFIER" | tr -d '[:space:]')
 assert_eq "verifier file written with 64 chars" "$VERIFIER_LEN" "64"
 
+# 6. Test quota output rendering
+TMP_PROF=$(mktemp)
+echo '{"email":"test_quota@example.com","token":{"access_token":"ya29.fake"}}' > "$TMP_PROF"
+QUOTA_OUT=$("$AUTH_PL" quota "$TMP_PROF")
+assert_contains "quota output has Models & Quota header" "$QUOTA_OUT" "Models & Quota"
+assert_contains "quota output has Account email" "$QUOTA_OUT" "Account: test_quota@example.com"
+assert_contains "quota output has GEMINI MODELS section" "$QUOTA_OUT" "GEMINI MODELS"
+assert_contains "quota output has CLAUDE AND GPT MODELS section" "$QUOTA_OUT" "CLAUDE AND GPT MODELS"
+assert_contains "quota output has weekly limit" "$QUOTA_OUT" "Weekly Limit Remaining"
+assert_contains "quota output has five hour limit" "$QUOTA_OUT" "Five Hour Limit Remaining"
+assert_contains "quota output has explanatory footer" "$QUOTA_OUT" "Within each group, models share a weekly limit"
+rm -f "$TMP_PROF"
+
 echo "Results: $((TOTAL - FAILED))/$TOTAL tests passed."
 if [[ $FAILED -gt 0 ]]; then
   exit 1

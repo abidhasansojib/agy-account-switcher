@@ -341,7 +341,20 @@ cmd_remove() {
 }
 
 cmd_limits() {
+  local target="${1:-}"
+  local refresh_flag="${2:-}"
   storage_init
+
+  if [[ -n "$target" && "$target" != "--refresh" && "$target" != "-f" ]]; then
+    local p_file
+    if ! p_file=$(storage_find_profile "$target"); then
+      tui_error "Account '$target' not found."
+      return 1
+    fi
+    "$AUTH_PL" quota "$p_file" "$refresh_flag"
+    return 0
+  fi
+
   local active
   active=$(storage_get_active)
 
@@ -353,8 +366,7 @@ cmd_limits() {
     return 0
   fi
 
-  echo "${BOLD}Account Status, Limits & Health:${RESET}"
-  echo ""
+  # Show overview table of all accounts first
   tui_table_header
 
   while IFS= read -r p; do
@@ -362,10 +374,9 @@ cmd_limits() {
     local p_file="$AGY_ACCOUNTS_DIR/profiles/${p}.json"
     [[ -f "$p_file" ]] || continue
 
-    local email expiry_raw expiry access_tok status_probe
+    local email expiry_raw expiry
     email=$(perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<>); print $d->{email} || "unknown";' "$p_file" 2>/dev/null || echo "unknown")
     expiry_raw=$(perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<>); print $d->{token}->{expiry} || "";' "$p_file" 2>/dev/null || echo "")
-    access_tok=$(perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<>); print $d->{token}->{access_token} || "";' "$p_file" 2>/dev/null || echo "")
 
     expiry=$("$AUTH_PL" countdown "$expiry_raw" 2>/dev/null || echo "Unknown")
 
@@ -380,24 +391,28 @@ cmd_limits() {
       fi
     fi
 
-    # Probe live status if access_tok exists
-    if [[ -n "$access_tok" && -x "$AUTH_PL" ]]; then
-      local probe_json
-      probe_json=$("$AUTH_PL" probe-status "$access_tok" 2>/dev/null || echo "")
-      if [[ -n "$probe_json" ]]; then
-        local p_status
-        p_status=$(perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<>); print $d->{status} || "";' <<< "$probe_json" 2>/dev/null || echo "")
-        if [[ "$p_status" == "RATE_LIMITED" ]]; then
-          badge=$(tui_status_badge RATE_LIMITED)
-        elif [[ "$p_status" == "AUTH_REVOKED" ]]; then
-          badge=$(tui_status_badge AUTH_REVOKED)
-        fi
-      fi
-    fi
-
     tui_table_row "$p" "$email" "$expiry" "$badge"
   done <<< "$profiles"
   echo ""
+
+  # Render exact Models & Quota for active profile (or first available)
+  local active_file=""
+  if [[ -n "$active" ]]; then
+    active_file=$(storage_find_profile "$active" 2>/dev/null || echo "")
+  fi
+  if [[ -z "$active_file" ]]; then
+    local first_prof
+    first_prof=$(echo "$profiles" | head -n 1)
+    active_file="$AGY_ACCOUNTS_DIR/profiles/${first_prof}.json"
+  fi
+
+  if [[ -f "$active_file" ]]; then
+    local force_flag=""
+    if [[ "$target" == "--refresh" || "$target" == "-f" || "$refresh_flag" == "--refresh" || "$refresh_flag" == "-f" ]]; then
+      force_flag="--refresh"
+    fi
+    "$AUTH_PL" quota "$active_file" $force_flag
+  fi
 }
 
 cmd_refresh() {

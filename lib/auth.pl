@@ -375,6 +375,132 @@ sub cmd_exchange_code {
     print JSON::PP->new->utf8->pretty->encode($profile);
 }
 
+sub make_quota_bar {
+    my ($pct) = @_;
+    my $width = 50;
+    my $filled = int(($pct / 100) * $width + 0.5);
+    $filled = 0 if $filled < 0;
+    $filled = $width if $filled > $width;
+    my $empty = $width - $filled;
+    return "[" . ("█" x $filled) . ("░" x $empty) . "]";
+}
+
+sub quota_countdown {
+    my ($ts) = @_;
+    return "Quota available" unless defined $ts && length($ts);
+    my $clean = $ts;
+    $clean =~ s/\.\d+//;
+    $clean =~ s/Z$//;
+    my $epoch = eval { Time::Piece->strptime($clean, "%Y-%m-%dT%H:%M:%S")->epoch };
+    return "Quota available" unless defined $epoch && !$@;
+    my $now = time();
+    my $diff = $epoch - $now;
+    return "Quota available" if $diff <= 0;
+    my $hours = int($diff / 3600);
+    my $mins = int(($diff % 3600) / 60);
+    if ($hours > 0) {
+        return "Refreshes in ${hours}h ${mins}m";
+    } else {
+        return "Refreshes in ${mins}m";
+    }
+}
+
+sub cmd_quota {
+    my ($profile_file, $refresh_flag) = @_;
+    die "Usage: auth.pl quota <profile_json_file> [--refresh]\n" unless defined $profile_file;
+
+    my $email = "unknown";
+    if (-f $profile_file) {
+        local $/;
+        open(my $fh, "<", $profile_file);
+        my $pdata = eval { JSON::PP::decode_json(<$fh>) };
+        close($fh);
+        $email = $pdata->{email} if $pdata && $pdata->{email};
+    }
+
+    my $cache_dir = $ENV{AGY_ACCOUNTS_DIR} ? "$ENV{AGY_ACCOUNTS_DIR}/cache" : "$ENV{HOME}/.gemini/agy-accounts/cache";
+    unless (-d $cache_dir) {
+        mkdir "$ENV{HOME}/.gemini/agy-accounts" unless -d "$ENV{HOME}/.gemini/agy-accounts";
+        mkdir $cache_dir unless -d $cache_dir;
+    }
+
+    my $clean_name = $profile_file;
+    $clean_name =~ s/^.*\///;
+    $clean_name =~ s/\.json$//;
+    my $cache_file = "$cache_dir/${clean_name}.quota";
+
+    my $force_refresh = (defined $refresh_flag && $refresh_flag =~ /--refresh|-f/i) ? 1 : 0;
+    my $raw_usage = "";
+
+    if (!$force_refresh && -f $cache_file && (time() - (stat($cache_file))[9] < 120)) {
+        if (open(my $cf, "<", $cache_file)) {
+            local $/;
+            $raw_usage = <$cf> || "";
+            close($cf);
+        }
+    }
+
+    if (!length($raw_usage) || $raw_usage !~ /Remaining/) {
+        my $agy_bin = $ENV{AGY_BIN_PATH} || `which agy 2>/dev/null` || "$ENV{HOME}/.local/bin/agy";
+        chomp $agy_bin if $agy_bin;
+        if ($agy_bin && -x $agy_bin) {
+            $raw_usage = `$agy_bin --print "/usage" 2>/dev/null` || "";
+            if (length($raw_usage) && $raw_usage =~ /Remaining/) {
+                if (open(my $cf, ">", $cache_file)) {
+                    print $cf $raw_usage;
+                    close($cf);
+                    chmod(0600, $cache_file);
+                }
+            }
+        }
+    }
+
+    my %data;
+    for my $line (split(/\n/, $raw_usage)) {
+        if ($line =~ /^(.*?)\t(.*?)\t(\d+(?:\.\d+)?%)\t(.*)$/ || $line =~ /^(.*?)\s{2,}(.*?)\s{2,}(\d+(?:\.\d+)?%)\s{2,}(.*)$/) {
+            my ($group, $limit_type, $pct_str, $ts) = ($1, $2, $3, $4);
+            my ($pct) = $pct_str =~ /(\d+(?:\.\d+)?)/;
+            $data{$group}{$limit_type} = { pct => $pct, ts => $ts };
+        }
+    }
+
+    print "└ Models & Quota\n\n";
+    print "  Account: $email\n\n";
+
+    print "GEMINI MODELS\n";
+    print "  Models within this group: Gemini Flash, Gemini Pro\n\n";
+
+    my $gw = $data{"Gemini Models"}{"Weekly Limit Remaining"} || { pct => 100 };
+    printf "  Weekly Limit Remaining\n";
+    printf "    %s %.2f%%\n", make_quota_bar($gw->{pct}), $gw->{pct};
+    printf "    %s\n\n", quota_countdown($gw->{ts});
+
+    my $g5 = $data{"Gemini Models"}{"Five Hour Limit Remaining"} || { pct => 100 };
+    printf "  Five Hour Limit Remaining\n";
+    printf "    %s %.2f%%\n", make_quota_bar($g5->{pct}), $g5->{pct};
+    printf "    %s\n\n\n", quota_countdown($g5->{ts});
+
+    print "CLAUDE AND GPT MODELS\n";
+    print "  Models within this group: Claude Opus, Claude Sonnet, GPT-OSS\n\n";
+
+    my $cw = $data{"Claude and GPT models"}{"Weekly Limit Remaining"} || { pct => 100 };
+    printf "  Weekly Limit Remaining\n";
+    printf "    %s %.2f%%\n", make_quota_bar($cw->{pct}), $cw->{pct};
+    printf "    %s\n\n", ($cw->{pct} >= 100 ? "Quota available" : quota_countdown($cw->{ts}));
+
+    my $c5 = $data{"Claude and GPT models"}{"Five Hour Limit Remaining"} || { pct => 100 };
+    printf "  Five Hour Limit Remaining\n";
+    printf "    %s %.2f%%\n", make_quota_bar($c5->{pct}), $c5->{pct};
+    printf "    %s\n\n\n", ($c5->{pct} >= 100 ? "Quota available" : quota_countdown($c5->{ts}));
+
+    print "  │Within each group, models share a weekly limit and a 5-hour limit. Quota is\n";
+    print "  │consumed proportionally to the cost of the tokens. Thus, limits will last\n";
+    print "  │longer with shorter tasks or using more cost-effective models. The 5-hour\n";
+    print "  │limit smooths out aggregate demand to fairly distribute global capacity\n";
+    print "  │across all users, while your weekly limit is tied directly to your individual\n";
+    print "  │tier.\n";
+}
+
 # Router
 my $cmd = shift @ARGV || "";
 if ($cmd eq "decode-jwt") {
@@ -391,6 +517,8 @@ if ($cmd eq "decode-jwt") {
     cmd_probe_status(shift @ARGV);
 } elsif ($cmd eq "exchange-code") {
     cmd_exchange_code(@ARGV);
+} elsif ($cmd eq "quota") {
+    cmd_quota(@ARGV);
 } else {
-    die "Unknown command: $cmd\nAvailable: decode-jwt, is-expired, countdown, oauth-url, refresh, probe-status, exchange-code\n";
+    die "Unknown command: $cmd\nAvailable: decode-jwt, is-expired, countdown, oauth-url, refresh, probe-status, exchange-code, quota\n";
 }

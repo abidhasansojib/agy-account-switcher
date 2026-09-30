@@ -5,36 +5,37 @@ description: Manage, list, inspect rate limits, and switch Antigravity Google ac
 
 # Antigravity Account Switcher (`/accounts`)
 
-This skill allows the user to manage multiple Google Antigravity accounts, inspect rate limits, and switch active credentials directly within an active Antigravity session without needing to re-login via browser every time.
+This skill manages multiple Google Antigravity accounts, displays live Models & Quota progress bars, and allows instant credential switching.
 
-## Available Actions
+## Instructions When User Runs `/accounts`
 
-### 1. Show Accounts & Rate Limits
-When the user types `/accounts`, `/accounts list`, or asks to see their accounts/limits:
-- Run `agy-accounts limits` or `agy-accounts list` via terminal.
-- Display the clean summary table showing:
-  - Profile name
-  - Google email address
-  - Token expiration countdown
-  - Current active status (`ACTIVE *` vs `ACTIVE`)
-  - Quota and rate-limit status
+### 1. Default Interactive Menu (`/accounts` or `/accounts menu` or `/accounts list`)
+When the user types `/accounts` without specific arguments:
+1. Run `agy-accounts limits` via terminal.
+2. Print the exact verbatim stdout of `agy-accounts limits` (containing the account table and the `└ Models & Quota` progress bars). Do NOT summarize, rewrite, or convert it into conversational bullet points.
+3. Immediately call `ask_question` with an interactive action menu:
+   - Question: "Antigravity Account Switcher — Select an action:"
+   - Options:
+     - "Switch active account"
+     - "Add new Google account (OAuth)"
+     - "Import current session as new profile"
+     - "Refresh limits and quota cache"
+     - "Remove an account profile"
+4. When the user selects an option:
+   - "Switch active account": Run `agy-accounts list` to get profiles, then call `ask_question` listing each available profile to switch to. Run `agy-accounts switch <selected>`.
+   - "Add new Google account (OAuth)": Prompt for profile name and run `agy-accounts add <name>`.
+   - "Import current session as new profile": Prompt for profile name and run `agy-accounts add <name> --import`.
+   - "Refresh limits and quota cache": Run `agy-accounts limits --refresh`.
+   - "Remove an account profile": Ask which profile to remove and run `agy-accounts remove <name> -y`.
 
-### 2. Switch Active Account
-When the user types `/accounts switch <name>` or asks to switch to another account (e.g., "switch to work account"):
-- Run `agy-accounts switch <name>`.
-- Confirm the new active account, email address, and token lifetime to the user.
+### 2. Direct Subcommands
+If the user passes arguments with `/accounts`, execute directly without displaying the menu:
+- `/accounts switch <name>`: Run `agy-accounts switch <name>`.
+- `/accounts add <name>`: If current session, run `agy-accounts add <name> --import`. Otherwise run `agy-accounts add <name>`.
+- `/accounts remove <name>`: Run `agy-accounts remove <name> -y`.
+- `/accounts current`: Run `agy-accounts current`.
+- `/accounts limits` or `/accounts quota`: Run `agy-accounts limits`.
 
-### 3. Add an Account
-When the user types `/accounts add <name>`:
-- If importing the current session: run `agy-accounts add <name> --import`.
-- If logging in a new Google account: inform the user to run `agy-accounts add <name>` in their terminal to open the authorization link.
-
-### 4. Remove an Account
-When the user types `/accounts remove <name>`:
-- Run `agy-accounts remove <name> -y`.
-- Confirm profile removal.
-
-### 5. Check Active Account
-When the user types `/accounts current` or asks which account is active:
-- Run `agy-accounts current`.
-- Report active profile name, email, and token expiry.
+### 3. Response Style
+- Never generate conversational AI fluff, markdown lists, or "Quick Actions" bullets when `/accounts` is called.
+- Always output the exact `└ Models & Quota` card and use the native interactive question modal for user navigation.
