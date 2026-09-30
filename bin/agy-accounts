@@ -247,12 +247,13 @@ cmd_add() {
     fi
   fi
 
+  storage_init
+  local verifier_file="$AGY_ACCOUNTS_DIR/.auth_verifier"
   local auth_url
-  auth_url=$("$AUTH_PL" oauth-url 4000)
+  auth_url=$("$AUTH_PL" oauth-url "$verifier_file")
 
   echo ""
-  tui_info "To add a new Google account, authorize it via your browser:"
-  echo ""
+  echo -e "${BOLD}Authentication required. Please visit the URL to log in:${RESET}"
   echo "  ${CYAN}${UNDERLINE:-}${auth_url}${RESET}"
   echo ""
 
@@ -261,14 +262,12 @@ cmd_add() {
     xdg-open "$auth_url" >/dev/null 2>&1 || true
   fi
 
-  echo "  ${DIM}After logging in, you will be redirected to localhost:4000/callback?code=...${RESET}"
-  echo "  ${DIM}Or if you are on a remote server, copy the 'code' parameter from the redirected URL.${RESET}"
-  echo ""
-
+  echo -e "${BOLD}Or, paste the authorization code here and press Enter:${RESET}"
   local code=""
-  code=$(tui_prompt "Enter the authorization code (or URL with code)")
+  code=$(tui_prompt "Authorization code")
 
   if [[ -z "$code" ]]; then
+    rm -f "$verifier_file"
     tui_error "No code provided. Aborted."
     return 1
   fi
@@ -277,13 +276,16 @@ cmd_add() {
   if [[ "$code" == *"code="* ]]; then
     code=$(echo "$code" | sed -n 's/.*code=\([^&]*\).*/\1/p')
   fi
+  code=$(echo "$code" | tr -d '[:space:]')
 
   tui_info "Exchanging code for credentials..."
   local new_profile_json
-  if ! new_profile_json=$("$AUTH_PL" exchange-code "$code" 4000 2>&1); then
+  if ! new_profile_json=$("$AUTH_PL" exchange-code "$code" "$verifier_file" 2>&1); then
+    rm -f "$verifier_file"
     tui_error "Failed to exchange code: $new_profile_json"
     return 1
   fi
+  rm -f "$verifier_file"
 
   storage_save_profile "$name" "$new_profile_json"
   tui_success "Account profile ${BOLD}${name}${RESET} created successfully!"

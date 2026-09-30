@@ -75,10 +75,17 @@ assert_contains "countdown past returns Expired" "$COUNTDOWN_PAST" "Expired"
 COUNTDOWN_FUTURE=$("$AUTH_PL" countdown "2035-01-01T00:00:00Z")
 assert_contains "countdown future returns remaining" "$COUNTDOWN_FUTURE" "remaining"
 
-# 5. Test oauth-url
-OAUTH_URL=$("$AUTH_PL" oauth-url)
-assert_contains "oauth-url uses Google auth endpoint" "$OAUTH_URL" "https://accounts.google.com/o/oauth2/v2/auth"
+# 5. Test oauth-url and PKCE verifier generation
+TMP_VERIFIER=$(mktemp)
+trap 'rm -f "$TMP_VERIFIER"' EXIT
+OAUTH_URL=$("$AUTH_PL" oauth-url "$TMP_VERIFIER")
+assert_contains "oauth-url uses Google auth endpoint" "$OAUTH_URL" "https://accounts.google.com/o/oauth2/auth"
+assert_contains "oauth-url uses antigravity.google callback" "$OAUTH_URL" "redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback"
+assert_contains "oauth-url uses PKCE S256 challenge" "$OAUTH_URL" "code_challenge_method=S256"
 assert_contains "oauth-url contains client_id parameter" "$OAUTH_URL" "client_id="
+
+VERIFIER_LEN=$(wc -c < "$TMP_VERIFIER" | tr -d '[:space:]')
+assert_eq "verifier file written with 64 chars" "$VERIFIER_LEN" "64"
 
 echo "Results: $((TOTAL - FAILED))/$TOTAL tests passed."
 if [[ $FAILED -gt 0 ]]; then

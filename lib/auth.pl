@@ -6,6 +6,7 @@ use MIME::Base64 qw(decode_base64 encode_base64);
 use Time::Piece;
 use POSIX qw(strftime);
 use HTTP::Tiny;
+use Digest::SHA qw(sha256);
 
 sub get_client_credentials {
     my $cid = $ENV{AGY_CLIENT_ID};
@@ -49,7 +50,9 @@ sub get_client_credentials {
 
 my ($CLIENT_ID, $CLIENT_SECRET) = get_client_credentials();
 my $TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
-my $AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
+my $AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/auth";
+my $REDIRECT_URI = "https://antigravity.google/oauth-callback";
+my $AUTH_SCOPES = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs https://www.googleapis.com/auth/aicode openid";
 
 sub decode_base64url {
     my ($b64) = @_;
@@ -135,12 +138,54 @@ sub cmd_countdown {
     }
 }
 
+sub generate_pkce {
+    my @chars = ('A'..'Z', 'a'..'z', '0'..'9', '-', '_', '.', '~');
+    my $verifier = "";
+    for (1..64) {
+        $verifier .= $chars[rand(@chars)];
+    }
+    my $raw_hash = sha256($verifier);
+    my $challenge = encode_base64($raw_hash, "");
+    $challenge =~ tr/+\//-_/;
+    $challenge =~ s/=+$//;
+    return ($verifier, $challenge);
+}
+
 sub cmd_oauth_url {
-    my ($port) = @_;
-    $port ||= 4000;
-    my $redirect_uri = "http://localhost:$port/callback";
-    my $scope = "openid%20email%20profile";
-    my $url = "$AUTH_ENDPOINT?client_id=$CLIENT_ID&redirect_uri=$redirect_uri&response_type=code&scope=$scope&access_type=offline&prompt=consent";
+    my ($verifier_file) = @_;
+    my ($verifier, $challenge) = generate_pkce();
+
+    if ($verifier_file) {
+        open(my $vf, ">", $verifier_file) or die "Cannot write to $verifier_file: $!\n";
+        print $vf $verifier;
+        close($vf);
+        chmod(0600, $verifier_file);
+    }
+
+    # Generate random state
+    my @state_chars = ('A'..'Z', 'a'..'z', '0'..'9');
+    my $state = "";
+    for (1..22) { $state .= $state_chars[rand(@state_chars)]; }
+
+    my $scope_encoded = $AUTH_SCOPES;
+    $scope_encoded =~ s/ /+/g;
+    $scope_encoded =~ s/:/%3A/g;
+    $scope_encoded =~ s/\//%2F/g;
+
+    my $redirect_encoded = $REDIRECT_URI;
+    $redirect_encoded =~ s/:/%3A/g;
+    $redirect_encoded =~ s/\//%2F/g;
+
+    my $url = "$AUTH_ENDPOINT?access_type=offline" .
+              "&client_id=$CLIENT_ID" .
+              "&code_challenge=$challenge" .
+              "&code_challenge_method=S256" .
+              "&prompt=consent" .
+              "&redirect_uri=$redirect_encoded" .
+              "&response_type=code" .
+              "&scope=$scope_encoded" .
+              "&state=$state";
+
     print "$url\n";
 }
 
@@ -246,18 +291,42 @@ sub cmd_probe_status {
 }
 
 sub cmd_exchange_code {
-    my ($code, $port) = @_;
-    $port ||= 4000;
-    die "Usage: auth.pl exchange-code <code> [port]\n" unless defined $code;
+    my ($code, $verifier_arg) = @_;
+    die "Usage: auth.pl exchange-code <code> [verifier_or_file]\n" unless defined $code;
+
+    # If full callback URL was provided, extract the code parameter
+    if ($code =~ /[?&]code=([^&]+)/) {
+        $code = $1;
+    }
+    # URL-decode the authorization code if encoded (e.g. %2F -> /)
+    if ($code =~ /%[0-9a-fA-F]{2}/) {
+        $code =~ s/%([0-9a-fA-F]{2})/chr(hex($1))/eg;
+    }
+    $code =~ s/^\s+|\s+$//g;
+
+    my $verifier = "";
+    if (defined $verifier_arg && length($verifier_arg)) {
+        if (-f $verifier_arg) {
+            open(my $vf, "<", $verifier_arg);
+            $verifier = <$vf> || "";
+            close($vf);
+            chomp $verifier;
+        } else {
+            $verifier = $verifier_arg;
+        }
+    }
 
     my $http = HTTP::Tiny->new(timeout => 15);
     my $form = {
         code => $code,
         client_id => $CLIENT_ID,
         client_secret => $CLIENT_SECRET,
-        redirect_uri => "http://localhost:$port/callback",
+        redirect_uri => $REDIRECT_URI,
         grant_type => "authorization_code"
     };
+    if (length($verifier)) {
+        $form->{code_verifier} = $verifier;
+    }
 
     my $resp = $http->post_form($TOKEN_ENDPOINT, $form);
     unless ($resp->{success}) {
