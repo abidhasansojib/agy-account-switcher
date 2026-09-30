@@ -1,0 +1,574 @@
+#!/usr/bin/env bash
+# bin/agy-accounts: Main executable for Antigravity Account Switcher
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# Locate library directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${AGY_LIB_DIR:-}" && -f "$AGY_LIB_DIR/storage.sh" ]]; then
+  LIB_DIR="$AGY_LIB_DIR"
+elif [[ -f "$SCRIPT_DIR/../lib/storage.sh" ]]; then
+  LIB_DIR="$SCRIPT_DIR/../lib"
+elif [[ -f "/usr/local/share/agy-accounts/lib/storage.sh" ]]; then
+  LIB_DIR="/usr/local/share/agy-accounts/lib"
+elif [[ -f "$HOME/.local/share/agy-accounts/lib/storage.sh" ]]; then
+  LIB_DIR="$HOME/.local/share/agy-accounts/lib"
+else
+  echo "Error: Could not locate agy-accounts library files." >&2
+  exit 1
+fi
+
+source "$LIB_DIR/storage.sh"
+source "$LIB_DIR/tui.sh"
+AUTH_PL="$LIB_DIR/auth.pl"
+
+show_help() {
+  cat << EOF
+${BOLD}AGY Account Switcher & Quota Monitor (v${VERSION})${RESET}
+Manage multiple Google Antigravity accounts, switch instantly, and check limits.
+
+${BOLD}USAGE:${RESET}
+  agy-accounts [COMMAND] [OPTIONS]
+  agy-switcher [COMMAND] [OPTIONS]
+
+${BOLD}COMMANDS:${RESET}
+  (no args)             Launch interactive terminal menu
+  list                  List all saved accounts and their active status
+  switch <name|email>   Switch active Antigravity session to specified account
+  current               Show details of the currently active account
+  add [name] [--import] Add an account via Google OAuth or import active session
+  remove <name|email>   Remove a saved account profile
+  limits                Check token lifetime, refresh health, and API quota status
+  refresh [name]        Force OAuth token refresh for an account
+  version               Display version information
+  help                  Show this help message
+
+${BOLD}EXAMPLES:${RESET}
+  agy-accounts add personal --import    # Save current agy login as 'personal'
+  agy-accounts switch work              # Switch to 'work' account instantly
+  agy-accounts limits                   # View remaining quota & status for all accounts
+  agy-accounts                          # Open interactive menu
+EOF
+}
+
+cmd_list() {
+  storage_init
+  local active
+  active=$(storage_get_active)
+
+  local profiles
+  profiles=$(storage_list_profiles)
+
+  if [[ -z "$profiles" ]]; then
+    tui_warn "No saved accounts found."
+    echo "  Use 'agy-accounts add <name> --import' to save your current login,"
+    echo "  or 'agy-accounts add <name>' to log into a new account."
+    return 0
+  fi
+
+  tui_table_header
+
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    local p_file="$AGY_ACCOUNTS_DIR/profiles/${p}.json"
+    [[ -f "$p_file" ]] || continue
+
+    local email expiry badge
+    email=$(perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<>); print $d->{email} || "unknown";' "$p_file" 2>/dev/null || echo "unknown")
+    expiry_raw=$(perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<>); print $d->{token}->{expiry} || "";' "$p_file" 2>/dev/null || echo "")
+
+    if [[ -n "$expiry_raw" && -x "$AUTH_PL" ]]; then
+      expiry=$("$AUTH_PL" countdown "$expiry_raw" 2>/dev/null || echo "Unknown")
+    else
+      expiry="Unknown"
+    fi
+
+    if [[ "$p" == "$active" ]]; then
+      badge=$(tui_status_badge ACTIVE_CURRENT)
+    else
+      if [[ "$expiry" == *"Expired"* ]]; then
+        badge=$(tui_status_badge EXPIRED)
+      else
+        badge=$(tui_status_badge ACTIVE)
+      fi
+    fi
+
+    tui_table_row "$p" "$email" "$expiry" "$badge"
+  done <<< "$profiles"
+  echo ""
+}
+
+cmd_switch() {
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    tui_error "Missing account name or email."
+    echo "Usage: agy-accounts switch <name|email>" >&2
+    return 1
+  fi
+
+  local target_file
+  if ! target_file=$(storage_find_profile "$target"); then
+    tui_error "Account '$target' not found."
+    return 1
+  fi
+
+  local clean_name
+  clean_name=$(basename "$target_file" .json)
+
+  storage_switch "$clean_name"
+
+  local email expiry
+  email=$(perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<>); print $d->{email} || "unknown";' "$target_file" 2>/dev/null || echo "unknown")
+  expiry_raw=$(perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<>); print $d->{token}->{expiry} || "";' "$target_file" 2>/dev/null || echo "")
+  expiry=$("$AUTH_PL" countdown "$expiry_raw" 2>/dev/null || echo "Unknown")
+
+  tui_success "Switched to ${BOLD}${clean_name}${RESET} (${CYAN}${email}${RESET})"
+  echo "  ${DIM}Token lifetime:${RESET} $expiry"
+  echo "  ${DIM}Active token:${RESET} $AGY_OAUTH_TOKEN_PATH"
+}
+
+cmd_current() {
+  local active
+  active=$(storage_get_active)
+
+  if [[ -z "$active" ]]; then
+    tui_warn "No active profile tracked by agy-accounts."
+    if [[ -f "$AGY_OAUTH_TOKEN_PATH" ]]; then
+      local email
+      email=$(perl -MJSON::PP -MFile::Basename -e '
+        use MIME::Base64 qw(decode_base64);
+        local $/;
+        my $d = eval { JSON::PP::decode_json(<>) };
+        if ($d && $d->{id_token}) {
+          my @p = split(/\./, $d->{id_token});
+          if (@p >= 2) {
+            my $b = $p[1]; $b =~ tr/-_/+\//; $b .= "=" x ((4 - length($b) % 4) % 4);
+            my $pl = eval { JSON::PP::decode_json(decode_base64($b)) };
+            print $pl->{email} if $pl;
+          }
+        }
+      ' "$AGY_OAUTH_TOKEN_PATH" 2>/dev/null || echo "")
+      if [[ -n "$email" ]]; then
+        echo "  Antigravity is currently authenticated as: ${CYAN}${email}${RESET}"
+        echo "  (Run 'agy-accounts add <name> --import' to save this account)"
+      fi
+    fi
+    return 0
+  fi
+
+  local p_file
+  p_file=$(storage_find_profile "$active") || {
+    tui_error "Profile '$active' file missing."
+    return 1
+  }
+
+  local email name expiry
+  email=$(perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<>); print $d->{email} || "unknown";' "$p_file")
+  name=$(perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<>); print $d->{display_name} || "";' "$p_file")
+  expiry_raw=$(perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<>); print $d->{token}->{expiry} || "";' "$p_file")
+  expiry=$("$AUTH_PL" countdown "$expiry_raw" 2>/dev/null || echo "Unknown")
+
+  echo "${BOLD}Active Account Details:${RESET}"
+  echo "  ${DIM}Profile Name:${RESET} ${GREEN}${BOLD}$active${RESET}"
+  echo "  ${DIM}Google Email:${RESET} ${CYAN}$email${RESET}"
+  if [[ -n "$name" ]]; then
+    echo "  ${DIM}Display Name:${RESET} $name"
+  fi
+  echo "  ${DIM}Token Status:${RESET} $expiry"
+  echo "  ${DIM}Credentials:${RESET}  $p_file"
+}
+
+cmd_add() {
+  local name="${1:-}"
+  local is_import=false
+
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --import)
+        is_import=true
+        shift
+        ;;
+      *)
+        if [[ -z "$name" ]]; then
+          name="$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if [[ "$is_import" == true ]]; then
+    if [[ ! -f "$AGY_OAUTH_TOKEN_PATH" ]]; then
+      tui_error "No active Antigravity session found at $AGY_OAUTH_TOKEN_PATH"
+      echo "  Log in using 'agy' first, or add via OAuth: 'agy-accounts add <name>'" >&2
+      return 1
+    fi
+
+    if [[ -z "$name" ]]; then
+      # Try to derive name from email in id_token
+      local derived
+      derived=$(perl -MJSON::PP -e '
+        use MIME::Base64 qw(decode_base64);
+        local $/;
+        my $d = eval { JSON::PP::decode_json(<>) };
+        if ($d && $d->{id_token}) {
+          my @p = split(/\./, $d->{id_token});
+          if (@p >= 2) {
+            my $b = $p[1]; $b =~ tr/-_/+\//; $b .= "=" x ((4 - length($b) % 4) % 4);
+            my $pl = eval { JSON::PP::decode_json(decode_base64($b)) };
+            if ($pl && $pl->{email}) {
+              my $user = (split(/@/, $pl->{email}))[0];
+              $user =~ s/[^a-zA-Z0-9_\-]/_/g;
+              print $user;
+            }
+          }
+        }
+      ' "$AGY_OAUTH_TOKEN_PATH" 2>/dev/null || echo "")
+      name="${derived:-default}"
+    fi
+
+    storage_save_profile "$name" "$AGY_OAUTH_TOKEN_PATH"
+    storage_set_active "$name"
+    tui_success "Imported current active session as profile ${BOLD}${name}${RESET}."
+    return 0
+  fi
+
+  # Interactive / OAuth Flow
+  if [[ -z "$name" ]]; then
+    name=$(tui_prompt "Enter a profile name for this account" "personal")
+  fi
+
+  if storage_find_profile "$name" >/dev/null 2>&1; then
+    if ! tui_confirm "Profile '$name' already exists. Overwrite?" "N"; then
+      echo "Aborted."
+      return 0
+    fi
+  fi
+
+  local auth_url
+  auth_url=$("$AUTH_PL" oauth-url 4000)
+
+  echo ""
+  tui_info "To add a new Google account, authorize it via your browser:"
+  echo ""
+  echo "  ${CYAN}${UNDERLINE:-}${auth_url}${RESET}"
+  echo ""
+
+  # Check if browser can be opened automatically
+  if command -v xdg-open >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+    xdg-open "$auth_url" >/dev/null 2>&1 || true
+  fi
+
+  echo "  ${DIM}After logging in, you will be redirected to localhost:4000/callback?code=...${RESET}"
+  echo "  ${DIM}Or if you are on a remote server, copy the 'code' parameter from the redirected URL.${RESET}"
+  echo ""
+
+  local code=""
+  code=$(tui_prompt "Enter the authorization code (or URL with code)")
+
+  if [[ -z "$code" ]]; then
+    tui_error "No code provided. Aborted."
+    return 1
+  fi
+
+  # Clean code if full URL was pasted
+  if [[ "$code" == *"code="* ]]; then
+    code=$(echo "$code" | sed -n 's/.*code=\([^&]*\).*/\1/p')
+  fi
+
+  tui_info "Exchanging code for credentials..."
+  local new_profile_json
+  if ! new_profile_json=$("$AUTH_PL" exchange-code "$code" 4000 2>&1); then
+    tui_error "Failed to exchange code: $new_profile_json"
+    return 1
+  fi
+
+  storage_save_profile "$name" "$new_profile_json"
+  tui_success "Account profile ${BOLD}${name}${RESET} created successfully!"
+
+  if tui_confirm "Switch to this account now?" "Y"; then
+    cmd_switch "$name"
+  fi
+}
+
+cmd_remove() {
+  local target=""
+  local force=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes|--force)
+        force=true
+        shift
+        ;;
+      *)
+        if [[ -z "$target" ]]; then
+          target="$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$target" ]]; then
+    tui_error "Missing account name to remove."
+    echo "Usage: agy-accounts remove <name|email> [-y]" >&2
+    return 1
+  fi
+
+  local p_file
+  if ! p_file=$(storage_find_profile "$target"); then
+    tui_error "Account '$target' not found."
+    return 1
+  fi
+
+  local name
+  name=$(basename "$p_file" .json)
+
+  if [[ "$force" != true && -t 0 ]]; then
+    if ! tui_confirm "Are you sure you want to remove profile '$name'?" "N"; then
+      echo "Aborted."
+      return 0
+    fi
+  fi
+
+  storage_remove_profile "$name"
+  tui_success "Profile ${BOLD}${name}${RESET} removed."
+}
+
+cmd_limits() {
+  storage_init
+  local active
+  active=$(storage_get_active)
+
+  local profiles
+  profiles=$(storage_list_profiles)
+
+  if [[ -z "$profiles" ]]; then
+    tui_warn "No saved accounts found."
+    return 0
+  fi
+
+  echo "${BOLD}Account Status, Limits & Health:${RESET}"
+  echo ""
+  tui_table_header
+
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    local p_file="$AGY_ACCOUNTS_DIR/profiles/${p}.json"
+    [[ -f "$p_file" ]] || continue
+
+    local email expiry_raw expiry access_tok status_probe
+    email=$(perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<>); print $d->{email} || "unknown";' "$p_file" 2>/dev/null || echo "unknown")
+    expiry_raw=$(perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<>); print $d->{token}->{expiry} || "";' "$p_file" 2>/dev/null || echo "")
+    access_tok=$(perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<>); print $d->{token}->{access_token} || "";' "$p_file" 2>/dev/null || echo "")
+
+    expiry=$("$AUTH_PL" countdown "$expiry_raw" 2>/dev/null || echo "Unknown")
+
+    local badge
+    if [[ "$p" == "$active" ]]; then
+      badge=$(tui_status_badge ACTIVE_CURRENT)
+    else
+      if [[ "$expiry" == *"Expired"* ]]; then
+        badge=$(tui_status_badge EXPIRED)
+      else
+        badge=$(tui_status_badge ACTIVE)
+      fi
+    fi
+
+    # Probe live status if access_tok exists
+    if [[ -n "$access_tok" && -x "$AUTH_PL" ]]; then
+      local probe_json
+      probe_json=$("$AUTH_PL" probe-status "$access_tok" 2>/dev/null || echo "")
+      if [[ -n "$probe_json" ]]; then
+        local p_status
+        p_status=$(perl -MJSON::PP -e 'local $/; my $d = JSON::PP::decode_json(<>); print $d->{status} || "";' <<< "$probe_json" 2>/dev/null || echo "")
+        if [[ "$p_status" == "RATE_LIMITED" ]]; then
+          badge=$(tui_status_badge RATE_LIMITED)
+        elif [[ "$p_status" == "AUTH_REVOKED" ]]; then
+          badge=$(tui_status_badge AUTH_REVOKED)
+        fi
+      fi
+    fi
+
+    tui_table_row "$p" "$email" "$expiry" "$badge"
+  done <<< "$profiles"
+  echo ""
+}
+
+cmd_refresh() {
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    target=$(storage_get_active)
+  fi
+
+  if [[ -z "$target" ]]; then
+    tui_error "No account specified and no active account found."
+    return 1
+  fi
+
+  local p_file
+  if ! p_file=$(storage_find_profile "$target"); then
+    tui_error "Profile '$target' not found."
+    return 1
+  fi
+
+  local name
+  name=$(basename "$p_file" .json)
+  tui_info "Refreshing OAuth token for profile '$name'..."
+  "$AUTH_PL" refresh "$p_file"
+
+  # If this is the active account, also update antigravity-oauth-token
+  local active
+  active=$(storage_get_active)
+  if [[ "$active" == "$name" ]]; then
+    storage_switch "$name"
+  fi
+  tui_success "Token refreshed."
+}
+
+interactive_menu() {
+  while true; do
+    clear 2>/dev/null || echo ""
+    local active
+    active=$(storage_get_active)
+    tui_banner "$active"
+
+    echo "  ${BOLD}[1]${RESET} Switch Account"
+    echo "  ${BOLD}[2]${RESET} List Accounts"
+    echo "  ${BOLD}[3]${RESET} Add Account (OAuth / Import)"
+    echo "  ${BOLD}[4]${RESET} Check Limits & Status"
+    echo "  ${BOLD}[5]${RESET} Current Account Info"
+    echo "  ${BOLD}[6]${RESET} Refresh Token"
+    echo "  ${BOLD}[7]${RESET} Remove Account"
+    echo "  ${BOLD}[0]${RESET} Exit"
+    echo ""
+
+    local choice
+    choice=$(tui_prompt "Choose an option" "1")
+
+    case "$choice" in
+      1)
+        echo ""
+        cmd_list
+        local acc
+        acc=$(tui_prompt "Enter account name to switch to")
+        if [[ -n "$acc" ]]; then
+          cmd_switch "$acc"
+        fi
+        ;;
+      2)
+        echo ""
+        cmd_list
+        ;;
+      3)
+        echo ""
+        echo "  [1] Import current active Antigravity session"
+        echo "  [2] Log in new Google Account via OAuth link"
+        local add_choice
+        add_choice=$(tui_prompt "Select method" "1")
+        if [[ "$add_choice" == "1" ]]; then
+          local iname
+          iname=$(tui_prompt "Enter profile name for current session")
+          cmd_add "$iname" --import
+        else
+          local oname
+          oname=$(tui_prompt "Enter profile name for new account")
+          cmd_add "$oname"
+        fi
+        ;;
+      4)
+        echo ""
+        cmd_limits
+        ;;
+      5)
+        echo ""
+        cmd_current
+        ;;
+      6)
+        echo ""
+        local racc
+        racc=$(tui_prompt "Enter account name to refresh (leave blank for active)")
+        cmd_refresh "$racc"
+        ;;
+      7)
+        echo ""
+        cmd_list
+        local del
+        del=$(tui_prompt "Enter account name to remove")
+        if [[ -n "$del" ]]; then
+          cmd_remove "$del"
+        fi
+        ;;
+      0|q|exit)
+        echo "Goodbye!"
+        break
+        ;;
+      *)
+        tui_error "Invalid option '$choice'"
+        ;;
+    esac
+
+    echo ""
+    read -r -p "Press [Enter] to continue..." _
+  done
+}
+
+# Main command dispatcher
+COMMAND="${1:-}"
+if [[ -z "$COMMAND" ]]; then
+  if [[ -t 0 ]]; then
+    interactive_menu
+  else
+    cmd_list
+  fi
+  exit 0
+fi
+
+shift || true
+case "$COMMAND" in
+  list|ls)
+    cmd_list
+    ;;
+  switch|use)
+    cmd_switch "$@"
+    ;;
+  current|whoami)
+    cmd_current
+    ;;
+  add|login)
+    cmd_add "$@"
+    ;;
+  remove|rm|delete)
+    cmd_remove "$@"
+    ;;
+  limits|quota|status)
+    cmd_limits
+    ;;
+  refresh)
+    cmd_refresh "$@"
+    ;;
+  version|-v|--version)
+    echo "agy-accounts version $VERSION"
+    ;;
+  help|-h|--help)
+    show_help
+    ;;
+  uninstall)
+    if [[ -f "$SCRIPT_DIR/../uninstall.sh" ]]; then
+      exec "$SCRIPT_DIR/../uninstall.sh"
+    elif [[ -f "/usr/local/share/agy-accounts/uninstall.sh" ]]; then
+      exec "/usr/local/share/agy-accounts/uninstall.sh"
+    else
+      tui_error "Uninstall script not found."
+      exit 1
+    fi
+    ;;
+  *)
+    tui_error "Unknown command: $COMMAND"
+    show_help >&2
+    exit 1
+    ;;
+esac

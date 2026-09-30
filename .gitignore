@@ -1,0 +1,6 @@
+# Temporary files and test artifacts
+*.tmp
+*.tmp.*
+*.bak
+*~
+.DS_Store
